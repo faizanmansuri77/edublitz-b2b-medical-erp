@@ -1,5 +1,5 @@
 # EduBlitz Medical B2B ERP — Complete Deployment Guide
-### From EC2 Launch → Jenkins CI/CD → Kubernetes on EKS → Live Application
+### EC2 Launch → Terraform Infrastructure → Jenkins CI/CD → Kubernetes on EKS → Live Application
 
 ---
 
@@ -7,17 +7,17 @@
 
 1. [Architecture Overview](#1-architecture-overview)
 2. [Prerequisites & Accounts](#2-prerequisites--accounts)
-3. [Phase 1 — Launch & Configure the Jenkins EC2 Server](#3-phase-1--launch--configure-the-jenkins-ec2-server)
-4. [Phase 2 — Install Jenkins & Required Tools](#4-phase-2--install-jenkins--required-tools)
-5. [Phase 3 — AWS Infrastructure Setup (Manual)](#5-phase-3--aws-infrastructure-setup-manual)
+3. [Phase 1 — Launch the Jenkins EC2 Server](#3-phase-1--launch-the-jenkins-ec2-server)
+4. [Phase 2 — Install Jenkins & All Required Tools](#4-phase-2--install-jenkins--all-required-tools)
+5. [Phase 3 — Terraform Infrastructure Provisioning](#5-phase-3--terraform-infrastructure-provisioning)
 6. [Phase 4 — MongoDB Atlas Setup](#6-phase-4--mongodb-atlas-setup)
-7. [Phase 5 — ECR — Container Registry](#7-phase-5--ecr--container-registry)
-8. [Phase 6 — EKS Cluster Setup](#8-phase-6--eks-cluster-setup)
+7. [Phase 5 — Docker Hub Registry Setup](#7-phase-5--docker-hub-registry-setup)
+8. [Phase 6 — Post-Terraform: EKS Add-ons](#8-phase-6--post-terraform-eks-add-ons)
 9. [Phase 7 — Configure Kubernetes Cluster](#9-phase-7--configure-kubernetes-cluster)
-10. [Phase 8 — Deploy Application Manifests to EKS](#10-phase-8--deploy-application-manifests-to-eks)
+10. [Phase 8 — First Manual Docker Build & EKS Deploy](#10-phase-8--first-manual-docker-build--eks-deploy)
 11. [Phase 9 — Jenkins Pipeline Setup](#11-phase-9--jenkins-pipeline-setup)
 12. [Phase 10 — Frontend Deployment (S3 + CloudFront)](#12-phase-10--frontend-deployment-s3--cloudfront)
-13. [Phase 11 — DNS & Domain Configuration](#13-phase-11--dns--domain-configuration)
+13. [Phase 11 — DNS Final Wiring](#13-phase-11--dns-final-wiring)
 14. [Phase 12 — Verify Live Application](#14-phase-12--verify-live-application)
 15. [Troubleshooting Reference](#15-troubleshooting-reference)
 16. [Security Hardening Checklist](#16-security-hardening-checklist)
@@ -29,73 +29,67 @@
 ```
 Internet
    │
-   ├── CloudFront CDN ─── S3 (React SPA)
+   ├── CloudFront CDN ─── S3 Bucket (React SPA)
+   │       (med-erp.yourdomain.com)
    │
    └── Route53 (api.med-erp.yourdomain.com)
           │
-          └── AWS ALB (created by EKS Ingress Controller)
+          └── AWS ALB  ← created automatically by EKS ALB Ingress Controller
                  │
-                 └── EKS Cluster (namespace: med-erp)
-                        ├── user-service    (port 8081) — Auth, JWT, RBAC
-                        ├── product-service (port 8082) — Products, Inventory
-                        └── order-service   (port 8083) — Orders, Billing
+                 └── EKS Cluster  (namespace: med-erp)
+                        ├── user-service    :8081  (Auth, JWT, RBAC, Orgs)
+                        ├── product-service :8082  (Products, Inventory)
+                        └── order-service   :8083  (Orders, Billing)
                                │
-                               └── MongoDB Atlas (3 separate databases)
+                               └── MongoDB Atlas
+                                      ├── users_db
+                                      ├── products_db
+                                      └── orders_db
+
+CI/CD: Jenkins (on EC2)
+       └── GitHub push → Pipeline triggers
+              ├── mvn test → SonarCloud → Docker build
+              ├── Push image → Docker Hub (orionpax77/med-erp-*)
+              ├── Trivy security scan
+              └── kubectl rollout → EKS
 ```
 
-**Tech Stack Summary**
+**Infrastructure provisioned by Terraform (modules in `terraform/`):**
 
-| Component | Technology |
+| Module | What It Creates |
 |---|---|
-| Frontend | React 18 + Vite + TailwindCSS, hosted on S3+CloudFront |
-| Backend | 3 Spring Boot 3.x microservices (Java 17) |
-| Database | MongoDB Atlas (cloud-managed) |
-| Auth | JWT (RS256), role-based (ADMIN / DISTRIBUTOR / HOSPITAL) |
-| Container Registry | AWS ECR |
-| Orchestration | AWS EKS (Kubernetes) |
-| CI/CD | Jenkins (running on EC2) |
-| IaC | Terraform (optional, modular) |
-| Security Scanning | Trivy (container images) |
-| Code Quality | SonarCloud |
+| `modules/vpc` | VPC, 3 public + 3 private subnets across AZs, IGW, NAT Gateways, route tables |
+| `modules/eks` | EKS cluster, IAM roles, node group, OIDC provider |
+| `modules/s3-cloudfront` | S3 bucket (private), CloudFront OAI distribution |
+| `modules/route53` | A record (frontend → CloudFront), CNAME (api → ALB) |
+
+> **Note:** The project repo includes an ECR module. Since we're using Docker Hub, that module is skipped. All other modules are used unchanged.
 
 ---
 
 ## 2. Prerequisites & Accounts
 
-Before starting, ensure you have the following ready:
-
 | Requirement | Details |
 |---|---|
-| AWS Account | With IAM admin access |
-| MongoDB Atlas Account | Free tier works for dev; M10+ for prod |
-| GitHub/GitLab Account | Repository hosting for source code |
-| SonarCloud Account | For quality gate (free for open-source) |
-| Domain Name | For Route53/SSL (e.g., yourdomain.com) |
-| Local Machine | AWS CLI, kubectl, eksctl installed |
-
-**Required AWS services that will be used:**
-- EC2 (Jenkins server)
-- EKS (Kubernetes cluster)
-- ECR (Docker image registry)
-- S3 (Frontend hosting)
-- CloudFront (CDN)
-- ACM (SSL/TLS certificates)
-- Route53 (DNS)
-- IAM (Roles and policies)
-- ALB (Application Load Balancer — auto-created by EKS)
+| AWS Account | IAM admin access |
+| MongoDB Atlas Account | Free M0 for dev, M10+ for production |
+| Docker Hub Account | Username: `orionpax77` |
+| GitHub Account | For source code hosting + webhooks |
+| SonarCloud Account | Free at sonarcloud.io (connect to GitHub) |
+| Domain Name | Registered domain for Route53 (e.g., `yourdomain.com`) |
+| Local Machine | AWS CLI, Terraform, kubectl installed |
 
 ---
 
-## 3. Phase 1 — Launch & Configure the Jenkins EC2 Server
+## 3. Phase 1 — Launch the Jenkins EC2 Server
 
 ### Step 1.1 — Create IAM Role for Jenkins EC2
 
-Before launching EC2, create an IAM role so Jenkins can access AWS services without hard-coding credentials.
+Jenkins needs to talk to EKS, S3, and CloudFront without hard-coded keys.
 
 1. Open **AWS Console → IAM → Roles → Create Role**
-2. Select **EC2** as the trusted entity
-3. Attach these policies:
-   - `AmazonEC2ContainerRegistryFullAccess`
+2. Trusted entity: **EC2**
+3. Attach these managed policies:
    - `AmazonEKSClusterPolicy`
    - `AmazonEKSWorkerNodePolicy`
    - `AmazonS3FullAccess`
@@ -103,76 +97,71 @@ Before launching EC2, create an IAM role so Jenkins can access AWS services with
 4. Name it: `Jenkins-EC2-Role`
 5. Click **Create Role**
 
-### Step 1.2 — Launch the EC2 Instance
+### Step 1.2 — Launch EC2 Instance
 
 1. Open **AWS Console → EC2 → Launch Instance**
-2. Configure the instance:
 
 | Setting | Value |
 |---|---|
 | Name | `jenkins-server` |
 | AMI | Ubuntu Server 22.04 LTS (HVM, SSD) |
-| Instance Type | `t3.medium` (minimum) or `t3.large` (recommended) |
-| Key Pair | Create new or select existing `.pem` key |
-| VPC | Default VPC or your custom VPC |
-| Subnet | Public subnet |
+| Instance Type | `t3.large` (recommended — Maven builds are CPU heavy) |
+| Key Pair | Create new `.pem` — save it safely |
+| VPC | Default VPC (Terraform will create the production VPC separately) |
+| Subnet | Any public subnet |
 | Auto-assign Public IP | Enabled |
-| Storage | 30 GB gp3 (increase to 50 GB for Maven cache) |
+| Storage | 50 GB gp3 (Maven cache needs space) |
 
-3. Under **Security Group**, create a new one named `jenkins-sg` with these inbound rules:
+2. Create a Security Group named `jenkins-sg`:
 
-| Type | Protocol | Port | Source | Purpose |
-|---|---|---|---|---|
-| SSH | TCP | 22 | Your IP only | Server access |
-| Custom TCP | TCP | 8080 | 0.0.0.0/0 | Jenkins Web UI |
-| Custom TCP | TCP | 50000 | 0.0.0.0/0 | Jenkins agent JNLP |
+| Type | Port | Source | Purpose |
+|---|---|---|---|
+| SSH | 22 | Your IP/32 | Server access |
+| Custom TCP | 8080 | 0.0.0.0/0 | Jenkins Web UI |
+| Custom TCP | 50000 | 0.0.0.0/0 | Jenkins agent JNLP |
 
-4. Under **Advanced Details → IAM instance profile**, select `Jenkins-EC2-Role`
-5. Click **Launch Instance**
+3. Under **Advanced Details → IAM instance profile** → select `Jenkins-EC2-Role`
+4. Click **Launch Instance**
 
 ### Step 1.3 — Connect to the Instance
 
 ```bash
-# Replace with your actual key file and EC2 public IP
 chmod 400 your-key.pem
 ssh -i your-key.pem ubuntu@<EC2-PUBLIC-IP>
 ```
 
-### Step 1.4 — Update System Packages
+### Step 1.4 — Update System
 
 ```bash
-sudo apt-get update -y
-sudo apt-get upgrade -y
+sudo apt-get update -y && sudo apt-get upgrade -y
 ```
 
 ---
 
-## 4. Phase 2 — Install Jenkins & Required Tools
+## 4. Phase 2 — Install Jenkins & All Required Tools
 
-Run all commands via SSH on the EC2 instance.
+Run all commands on the EC2 instance via SSH.
 
-### Step 2.1 — Install Java 21 (required for Jenkins)
+### Step 2.1 — Install Java 17
 
 ```bash
-sudo apt-get install -y fontconfig openjdk-21-jre
+sudo apt-get install -y fontconfig openjdk-17-jre
 java -version
-# Expected output: openjdk version "17.x.x"
+# Expected: openjdk version "17.x.x"
 ```
 
 ### Step 2.2 — Install Jenkins
 
 ```bash
-# Add Jenkins GPG key and repository
-sudo wget -O /etc/apt/keyrings/jenkins-keyring.asc \
-https://pkg.jenkins.io/debian-stable/jenkins.io-2026.key
-echo "deb [signed-by=/etc/apt/keyrings/jenkins-keyring.asc]" \
-https://pkg.jenkins.io/debian-stable binary/ | sudo tee \
-/etc/apt/sources.list.d/jenkins.list > /dev/null
+sudo wget -O /usr/share/keyrings/jenkins-keyring.asc \
+  https://pkg.jenkins.io/debian-stable/jenkins.io-2023.key
+
+echo "deb [signed-by=/usr/share/keyrings/jenkins-keyring.asc] \
+  https://pkg.jenkins.io/debian-stable binary/" | \
+  sudo tee /etc/apt/sources.list.d/jenkins.list > /dev/null
 
 sudo apt-get update -y
 sudo apt-get install -y jenkins
-
-# Start and enable Jenkins
 sudo systemctl enable jenkins
 sudo systemctl start jenkins
 sudo systemctl status jenkins
@@ -180,13 +169,10 @@ sudo systemctl status jenkins
 
 ### Step 2.3 — Install Docker
 
-Jenkins pipelines use Docker-in-Docker (DinD) via Kubernetes pods. Docker must also be on the host for local builds if needed.
-
 ```bash
-# Install Docker
 sudo apt-get install -y ca-certificates curl gnupg lsb-release
-
 sudo mkdir -p /etc/apt/keyrings
+
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
   sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 
@@ -199,11 +185,9 @@ echo "deb [arch=$(dpkg --print-architecture) \
 sudo apt-get update -y
 sudo apt-get install -y docker-ce docker-ce-cli containerd.io
 
-# Add jenkins and ubuntu users to docker group
 sudo usermod -aG docker jenkins
 sudo usermod -aG docker ubuntu
 
-# Start Docker
 sudo systemctl enable docker
 sudo systemctl start docker
 docker --version
@@ -220,7 +204,26 @@ aws --version
 # Expected: aws-cli/2.x.x
 ```
 
-### Step 2.5 — Install kubectl
+### Step 2.5 — Install Terraform
+
+```bash
+sudo apt-get install -y gnupg software-properties-common
+
+wget -O- https://apt.releases.hashicorp.com/gpg | \
+  gpg --dearmor | \
+  sudo tee /usr/share/keyrings/hashicorp-archive-keyring.gpg > /dev/null
+
+echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] \
+  https://apt.releases.hashicorp.com $(lsb_release -cs) main" | \
+  sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+sudo apt-get update -y
+sudo apt-get install -y terraform
+terraform version
+# Expected: Terraform v1.x.x
+```
+
+### Step 2.6 — Install kubectl
 
 ```bash
 curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
@@ -228,280 +231,573 @@ sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
 kubectl version --client
 ```
 
-### Step 2.6 — Install eksctl
+### Step 2.7 — Install eksctl
 
 ```bash
 ARCH=amd64
 PLATFORM=$(uname -s)_$ARCH
-
 curl -sLO "https://github.com/eksctl-io/eksctl/releases/latest/download/eksctl_$PLATFORM.tar.gz"
 tar -xzf eksctl_$PLATFORM.tar.gz -C /tmp
 sudo mv /tmp/eksctl /usr/local/bin
 eksctl version
 ```
 
-### Step 2.7 — Install Helm
+### Step 2.8 — Install Helm
 
 ```bash
-sudo apt-get install curl gpg apt-transport-https --yes
-curl -fsSL https://packages.buildkite.com/helm-linux/helm-debian/gpgkey | gpg --dearmor | sudo tee /usr/share/keyrings/helm.gpg > /dev/null
-echo "deb [signed-by=/usr/share/keyrings/helm.gpg] https://packages.buildkite.com/helm-linux/helm-debian/any/ any main" | sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
-sudo apt-get update
-sudo apt-get install helm
+curl https://baltocdn.com/helm/signing.asc | gpg --dearmor | \
+  sudo tee /usr/share/keyrings/helm.gpg > /dev/null
+
+sudo apt-get install -y apt-transport-https
+
+echo "deb [arch=$(dpkg --print-architecture) \
+  signed-by=/usr/share/keyrings/helm.gpg] \
+  https://baltocdn.com/helm/stable/debian/ all main" | \
+  sudo tee /etc/apt/sources.list.d/helm-stable-debian.list
+
+sudo apt-get update -y
+sudo apt-get install -y helm
 helm version
 ```
 
-### Step 2.8 — Configure Jenkins Initial Setup
+### Step 2.9 — Configure AWS CLI on EC2
+
+The EC2 has the IAM role attached, but you still need a region default:
+
+```bash
+aws configure set region us-east-1
+aws configure set output json
+
+# Verify identity (uses instance role, no keys needed)
+aws sts get-caller-identity
+# Should return your account ID and the Jenkins-EC2-Role ARN
+```
+
+### Step 2.10 — Jenkins Initial Setup
 
 1. Get the initial admin password:
    ```bash
    sudo cat /var/lib/jenkins/secrets/initialAdminPassword
    ```
-2. Open browser: `http://<EC2-PUBLIC-IP>:8080`
-3. Enter the password from above
-4. Click **Install suggested plugins** and wait for installation
-5. Create your admin user (save credentials safely)
+2. Open `http://<EC2-PUBLIC-IP>:8080` in your browser
+3. Enter the password
+4. Click **Install suggested plugins** — wait for completion
+5. Create your admin user and save the credentials
 6. Set Jenkins URL to `http://<EC2-PUBLIC-IP>:8080`
 
-### Step 2.9 — Install Required Jenkins Plugins
+### Step 2.11 — Install Additional Jenkins Plugins
 
-Go to **Manage Jenkins → Plugins → Available plugins** and install:
+Go to **Manage Jenkins → Plugins → Available plugins**, search and install:
 
-- Kubernetes (for Kubernetes agent pods)
-- Docker Pipeline
-- Amazon ECR
-- AWS Credentials
-- Pipeline: AWS Steps
-- SonarQube Scanner
-- JUnit
-- Git
-- Blue Ocean (optional, for better UI)
+- `Kubernetes`
+- `Docker Pipeline`
+- `CloudBees Docker Build and Publish`
+- `AWS Credentials`
+- `Pipeline: AWS Steps`
+- `SonarQube Scanner`
+- `JUnit`
+- `Blue Ocean` (optional — cleaner pipeline UI)
 
-Restart Jenkins after installation.
-
-### Step 2.10 — Install Kubernetes Plugin for Jenkins (Agent Pods)
-
-This project uses **Kubernetes-based Jenkins agents** (pods spin up per build). Configure the Kubernetes cloud:
-
-1. Go to **Manage Jenkins → Clouds → New Cloud → Kubernetes**
-2. Set **Kubernetes URL**: Run on EC2 and get value with:
-   ```bash
-   kubectl cluster-info | grep "Kubernetes control plane"
-   ```
-3. Set **Jenkins URL**: `http://<EC2-PRIVATE-IP>:8080`
-4. Set **Jenkins tunnel**: `<EC2-PRIVATE-IP>:50000`
-5. Click **Test Connection** — it should succeed
-6. Save
+Restart Jenkins after installation: `sudo systemctl restart jenkins`
 
 ---
 
-## 5. Phase 3 — AWS Infrastructure Setup (Manual)
+## 5. Phase 3 — Terraform Infrastructure Provisioning
 
-> **Note:** This project includes Terraform modules in `terraform/` for automated infrastructure. The manual steps below are the equivalent — follow one approach only.
+All Terraform code lives in the `terraform/` directory of the project. We will provision the **dev** environment first, then the same steps apply for prod.
 
-### Step 3.1 — Create VPC (if not using default)
+### Step 3.1 — Create Terraform State Backend (S3 + DynamoDB)
 
-For production, create a dedicated VPC:
+Terraform uses remote state. Create these AWS resources manually first (only done once):
 
 ```bash
-# Using AWS CLI
-aws ec2 create-vpc \
-  --cidr-block 10.0.0.0/16 \
-  --tag-specifications 'ResourceType=vpc,Tags=[{Key=Name,Value=med-erp-vpc}]'
+# Create S3 bucket for state storage
+aws s3 mb s3://med-erp-terraform-state-dev --region us-east-1
+
+# Enable versioning on the bucket
+aws s3api put-bucket-versioning \
+  --bucket med-erp-terraform-state-dev \
+  --versioning-configuration Status=Enabled
+
+# Enable encryption
+aws s3api put-bucket-encryption \
+  --bucket med-erp-terraform-state-dev \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+# Block public access on state bucket
+aws s3api put-public-access-block \
+  --bucket med-erp-terraform-state-dev \
+  --public-access-block-configuration \
+  "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+
+# Create DynamoDB table for state locking
+aws dynamodb create-table \
+  --table-name med-erp-terraform-locks \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region us-east-1
+
+echo "Terraform backend resources created."
 ```
 
-For the full Terraform approach, see `terraform/modules/vpc/main.tf` in the repository.
+### Step 3.2 — Request ACM SSL Certificate (Required Before Terraform)
 
-### Step 3.2 — Create an ACM SSL Certificate
+CloudFront requires an ACM certificate in `us-east-1` regardless of your region. Request it before running Terraform:
 
-Required for HTTPS on ALB and CloudFront:
+```bash
+aws acm request-certificate \
+  --domain-name "yourdomain.com" \
+  --subject-alternative-names "*.yourdomain.com" \
+  --validation-method DNS \
+  --region us-east-1
+```
 
-1. **AWS Console → Certificate Manager → Request Certificate**
-2. Select **Request a public certificate**
-3. Add domain names:
-   - `yourdomain.com`
-   - `*.yourdomain.com`
-   - `api.med-erp.yourdomain.com`
-4. Select **DNS validation**
-5. Click **Request** — copy the CNAME record shown
-6. Add that CNAME to your DNS provider (or Route53)
-7. Wait for status to show **Issued** (up to 30 minutes)
-8. **Save the Certificate ARN** — you'll need it later
+**Validate the certificate:**
+1. Go to **AWS Console → Certificate Manager → Certificates**
+2. Find your pending certificate
+3. Click **Create records in Route53** (if domain is in Route53) — OR add the CNAME manually to your DNS provider
+4. Wait for status to change to **Issued** (~5–30 minutes)
+5. **Copy the Certificate ARN** — you'll need it in `terraform.tfvars`
+
+### Step 3.3 — Clone the Project to the Jenkins Server
+
+```bash
+cd /home/ubuntu
+git clone https://github.com/YOUR_ORG/edublitz-b2b-medical-erp.git
+cd edublitz-b2b-medical-erp
+```
+
+### Step 3.4 — Prepare Terraform Variables File
+
+Navigate to the dev environment:
+
+```bash
+cd terraform/env/dev
+cp terraform.tfvars.example terraform.tfvars
+```
+
+Edit `terraform.tfvars` with your real values:
+
+```hcl
+# terraform/env/dev/terraform.tfvars
+
+aws_region          = "us-east-1"
+domain_name         = "yourdomain.com"
+acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+developer_ip_cidr   = "YOUR_MACHINE_PUBLIC_IP/32"
+alb_dns_name        = ""   # Leave blank — fill AFTER first kubectl ingress apply
+```
+
+> Get your public IP: `curl ifconfig.me`
+
+### Step 3.5 — Understand What Terraform Will Create
+
+Running `terraform apply` for the **dev** environment provisions:
+
+**VPC Module** (`modules/vpc`):
+- 1 VPC (`10.10.0.0/16`)
+- 3 public subnets (one per AZ) — tagged for ALB
+- 3 private subnets (one per AZ) — EKS worker nodes live here
+- 1 Internet Gateway
+- 3 NAT Gateways (one per AZ for HA) + Elastic IPs
+- Public and private route tables
+
+**EKS Module** (`modules/eks`):
+- EKS cluster `med-erp-dev-eks` running Kubernetes 1.30
+- IAM role for the control plane + policies
+- IAM role for worker nodes + policies (Worker, CNI, ECR read, SSM)
+- Managed node group: `t3.medium`, SPOT capacity, 1–4 nodes
+- OIDC provider for IRSA (IAM Roles for Service Accounts)
+- Security group for the cluster API endpoint
+
+**S3 + CloudFront Module** (`modules/s3-cloudfront`):
+- Private S3 bucket `med-erp-frontend-dev` (versioned, encrypted)
+- CloudFront Origin Access Identity (OAI)
+- CloudFront distribution with HTTPS redirect, SPA 404→index.html fallback, 1-year asset caching
+
+**Route53 Module** (`modules/route53`):
+- A record alias: `dev.med-erp.yourdomain.com` → CloudFront
+- CNAME: `dev.api.med-erp.yourdomain.com` → ALB DNS (filled in later)
+
+### Step 3.6 — Initialize Terraform
+
+```bash
+cd /home/ubuntu/edublitz-b2b-medical-erp/terraform/env/dev
+
+terraform init
+```
+
+Expected output:
+```
+Initializing the backend...
+Successfully configured the backend "s3"!
+Initializing modules...
+- dns in ../../modules/route53
+- eks in ../../modules/eks
+- frontend in ../../modules/s3-cloudfront
+- vpc in ../../modules/vpc
+Terraform has been successfully initialized!
+```
+
+### Step 3.7 — Review the Execution Plan
+
+```bash
+terraform plan -out=tfplan
+```
+
+Review the output carefully. You should see approximately **50–60 resources** to be created including the VPC, subnets, NAT gateways, EKS cluster, node group, S3 bucket, and CloudFront distribution.
+
+Key things to verify in the plan:
+- VPC CIDR matches `10.10.0.0/16`
+- EKS cluster name is `med-erp-dev-eks`
+- CloudFront uses your ACM certificate ARN
+- Route53 zone matches your domain
+
+### Step 3.8 — Apply Terraform
+
+```bash
+terraform apply tfplan
+```
+
+> **Important:** This takes 15–25 minutes. EKS cluster creation alone takes 10–15 minutes. Do not interrupt it.
+
+Expected final output:
+```
+Apply complete! Resources: 54 added, 0 changed, 0 destroyed.
+
+Outputs:
+cloudfront_distribution_id = "E1ABCDEF1234567"
+cloudfront_domain_name     = "dXXXXXXXXXXXX.cloudfront.net"
+eks_cluster_endpoint       = "https://XXXXXXXXXXXX.gr7.us-east-1.eks.amazonaws.com"
+eks_cluster_name           = "med-erp-dev-eks"
+s3_frontend_bucket         = "med-erp-frontend-dev"
+vpc_id                     = "vpc-XXXXXXXXXXXXXXXXX"
+```
+
+**Save all these output values** — you will need them in later phases.
+
+### Step 3.9 — Update kubeconfig to Access New EKS Cluster
+
+```bash
+aws eks update-kubeconfig \
+  --region us-east-1 \
+  --name med-erp-dev-eks
+
+# Verify cluster access
+kubectl get nodes
+# Expected: 2 nodes in Ready state (may take 2-3 minutes after apply)
+```
+
+### Step 3.10 — Production Environment (When Ready)
+
+When you're ready to provision production, follow the same steps using `terraform/env/prod/`:
+
+```bash
+# Create prod state bucket (same DynamoDB table can be shared)
+aws s3 mb s3://med-erp-terraform-state-prod --region us-east-1
+
+cd /home/ubuntu/edublitz-b2b-medical-erp/terraform/env/prod
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars with prod values
+
+terraform init
+terraform plan -out=tfplan
+terraform apply tfplan
+```
+
+Prod differences (already configured in `terraform/env/prod/main.tf`):
+- CIDR: `10.20.0.0/16` (separate from dev)
+- Node type: `m5.xlarge` (instead of `t3.medium`)
+- Capacity: `ON_DEMAND` (no spot interruptions)
+- Node count: 2–10 (instead of 1–4)
+- EKS API endpoint: private-only (`endpoint_public_access = false`)
 
 ---
 
 ## 6. Phase 4 — MongoDB Atlas Setup
 
-### Step 4.1 — Create Atlas Cluster
+### Step 4.1 — Create Atlas Project and Cluster
 
 1. Log in at [cloud.mongodb.com](https://cloud.mongodb.com)
-2. Create a new project: `med-erp-prod`
-3. **Build a Database → Shared (M0 free) or M10+ for production**
-4. Select **AWS** as provider, region `us-east-1`
-5. Name the cluster: `med-erp-cluster`
+2. Create project: `med-erp-dev`
+3. **Build a Database** → M0 (free) for dev, M10 for prod
+4. Provider: **AWS**, Region: `us-east-1`
+5. Cluster name: `med-erp-cluster`
 6. Click **Create**
 
-### Step 4.2 — Create Databases and Users
+### Step 4.2 — Create Database Users (Least-Privilege)
 
-In MongoDB Atlas → **Database Access → Add New Database User**:
+Go to **Database Access → Add New Database User** for each:
 
-Create three separate users (least-privilege):
+| Username | Password | Database Access |
+|---|---|---|
+| `user-svc` | strong_password_1 | `readWrite` on `users_db` only |
+| `product-svc` | strong_password_2 | `readWrite` on `products_db` only |
+| `order-svc` | strong_password_3 | `readWrite` on `orders_db` only |
 
-| Username | Password | Database | Role |
-|---|---|---|---|
-| `user-svc` | strong password | `users_db` | `readWrite` |
-| `product-svc` | strong password | `products_db` | `readWrite` |
-| `order-svc` | strong password | `orders_db` | `readWrite` |
+### Step 4.3 — Allow Network Access from EKS
 
-### Step 4.3 — Allow Network Access
+Get the NAT Gateway IPs from Terraform output:
 
-In Atlas → **Network Access → Add IP Address**:
+```bash
+# These are the IPs EKS worker nodes use to reach the internet
+aws ec2 describe-nat-gateways \
+  --filter "Name=tag:Project,Values=med-erp" \
+  --query 'NatGateways[*].NatGatewayAddresses[*].PublicIp' \
+  --output text
+```
 
-- Add the **NAT Gateway IP** of your EKS cluster's VPC (for production)
-- During testing you can temporarily add `0.0.0.0/0` (not recommended for prod)
+In Atlas → **Network Access → Add IP Address**, add all 3 NAT Gateway IPs with `/32`.
 
 ### Step 4.4 — Get Connection Strings
 
-In Atlas → **Database → Connect → Drivers → Java**:
-
-Your connection strings will look like:
+Atlas → **Database → Connect → Drivers → Java**:
 
 ```
-mongodb+srv://user-svc:<PASSWORD>@med-erp-cluster.xxxxx.mongodb.net/users_db?retryWrites=true&w=majority
-mongodb+srv://product-svc:<PASSWORD>@med-erp-cluster.xxxxx.mongodb.net/products_db?retryWrites=true&w=majority
-mongodb+srv://order-svc:<PASSWORD>@med-erp-cluster.xxxxx.mongodb.net/orders_db?retryWrites=true&w=majority
+mongodb+srv://user-svc:PASSWORD@med-erp-cluster.xxxxx.mongodb.net/users_db?retryWrites=true&w=majority
+mongodb+srv://product-svc:PASSWORD@med-erp-cluster.xxxxx.mongodb.net/products_db?retryWrites=true&w=majority
+mongodb+srv://order-svc:PASSWORD@med-erp-cluster.xxxxx.mongodb.net/orders_db?retryWrites=true&w=majority
 ```
 
-**Save these three strings — they become Kubernetes Secrets.**
+**Save all three** — they become Kubernetes Secrets in Phase 7.
 
 ---
 
-## 7. Phase 5 — ECR — Container Registry
+## 7. Phase 5 — Docker Hub Registry Setup
 
-### Step 5.1 — Create ECR Repositories
+We use Docker Hub (`orionpax77`) instead of ECR.
 
-Create one repository per microservice:
+### Step 5.1 — Create Docker Hub Repositories
 
-```bash
-aws ecr create-repository \
-  --repository-name med-erp/user-service \
-  --region us-east-1 \
-  --image-scanning-configuration scanOnPush=true
+Log in at [hub.docker.com](https://hub.docker.com) and create these **public or private** repositories:
 
-aws ecr create-repository \
-  --repository-name med-erp/product-service \
-  --region us-east-1 \
-  --image-scanning-configuration scanOnPush=true
+| Repository Name | Full Image Path |
+|---|---|
+| `med-erp-user-service` | `orionpax77/med-erp-user-service` |
+| `med-erp-product-service` | `orionpax77/med-erp-product-service` |
+| `med-erp-order-service` | `orionpax77/med-erp-order-service` |
 
-aws ecr create-repository \
-  --repository-name med-erp/order-service \
-  --region us-east-1 \
-  --image-scanning-configuration scanOnPush=true
+### Step 5.2 — Create a Docker Hub Access Token
+
+Docker Hub → **Account Settings → Security → New Access Token**:
+
+- Token description: `jenkins-ci`
+- Access permissions: `Read, Write, Delete`
+- Copy the generated token — you will not see it again
+
+### Step 5.3 — Update Kubernetes Deployments for Docker Hub
+
+The deployment YAMLs in `k8s/deployments/` reference `YOUR_ECR_REGISTRY`. Update each file:
+
+`k8s/deployments/user-service-deployment.yaml`:
+```yaml
+# Change this line:
+image: YOUR_ECR_REGISTRY/user-service:latest
+# To:
+image: orionpax77/med-erp-user-service:latest
 ```
 
-### Step 5.2 — Note Your ECR Registry URL
-
-```bash
-aws sts get-caller-identity --query Account --output text
-# Output: 123456789012 (your AWS account ID)
-
-# Your ECR base URL will be:
-# 123456789012.dkr.ecr.us-east-1.amazonaws.com
+`k8s/deployments/product-service-deployment.yaml`:
+```yaml
+image: orionpax77/med-erp-product-service:latest
 ```
 
-Save this as `ECR_REGISTRY` — it's referenced throughout the Jenkinsfiles.
+`k8s/deployments/order-service-deployment.yaml`:
+```yaml
+image: orionpax77/med-erp-order-service:latest
+```
+
+### Step 5.4 — Update Jenkins Backend Jenkinsfile for Docker Hub
+
+The Jenkinsfile at `jenkins/Jenkinsfile.backend` was written for ECR. Update the Docker stages:
+
+**Replace the `Docker Build & Push` stage with:**
+
+```groovy
+stage('Docker Build & Push') {
+    when { branch 'main' }
+    steps {
+        withCredentials([usernamePassword(
+            credentialsId: 'DOCKERHUB_CREDENTIALS',
+            usernameVariable: 'DOCKER_USER',
+            passwordVariable: 'DOCKER_PASS'
+        )]) {
+            container('docker') {
+                script {
+                    sh "echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin"
+
+                    ['user-service', 'product-service', 'order-service'].each { svc ->
+                        def imageName  = "orionpax77/med-erp-${svc}:${IMAGE_TAG}"
+                        def imageLatest = "orionpax77/med-erp-${svc}:latest"
+
+                        sh """
+                            docker build -t ${imageName} -t ${imageLatest} ${svc}/
+                            docker push ${imageName}
+                            docker push ${imageLatest}
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+**Replace the `Trivy Security Scan` stage with:**
+
+```groovy
+stage('Trivy Security Scan') {
+    when { branch 'main' }
+    steps {
+        container('trivy') {
+            script {
+                ['user-service', 'product-service', 'order-service'].each { svc ->
+                    sh """
+                        trivy image \
+                          --exit-code 1 \
+                          --severity HIGH,CRITICAL \
+                          --no-progress \
+                          --format table \
+                          orionpax77/med-erp-${svc}:${IMAGE_TAG} \
+                        || (echo "Trivy found vulnerabilities in ${svc}" && exit 1)
+                    """
+                }
+            }
+        }
+    }
+}
+```
+
+**Replace the `Deploy to EKS` stage with:**
+
+```groovy
+stage('Deploy to EKS') {
+    when { branch 'main' }
+    steps {
+        withCredentials([
+            file(credentialsId: 'KUBECONFIG_CREDENTIAL', variable: 'KUBECONFIG'),
+            [
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'AWS_CREDENTIALS',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]
+        ]) {
+            container('kubectl') {
+                script {
+                    sh "aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER}"
+
+                    ['user-service', 'product-service', 'order-service'].each { svc ->
+                        sh """
+                            kubectl set image deployment/${svc} \
+                              ${svc}=orionpax77/med-erp-${svc}:${IMAGE_TAG} \
+                              -n ${K8S_NAMESPACE}
+
+                            kubectl rollout status deployment/${svc} \
+                              -n ${K8S_NAMESPACE} --timeout=5m
+                        """
+                    }
+                }
+            }
+        }
+    }
+}
+```
+
+**Also update the `environment` block** at the top of `Jenkinsfile.backend` — remove ECR references:
+
+```groovy
+environment {
+    AWS_REGION    = 'us-east-1'
+    DOCKER_REGISTRY = 'orionpax77'
+    EKS_CLUSTER   = 'med-erp-dev-eks'
+    K8S_NAMESPACE = 'med-erp'
+    IMAGE_TAG     = "${env.GIT_COMMIT.take(8)}"
+}
+```
+
+If Docker Hub repositories are **private**, EKS needs a pull secret:
+
+```bash
+kubectl create secret docker-registry dockerhub-secret \
+  --docker-server=https://index.docker.io/v1/ \
+  --docker-username=orionpax77 \
+  --docker-password=YOUR_ACCESS_TOKEN \
+  --docker-email=your-email@example.com \
+  -n med-erp
+```
+
+Then add to each deployment YAML under `spec.template.spec`:
+
+```yaml
+imagePullSecrets:
+  - name: dockerhub-secret
+```
 
 ---
 
-## 8. Phase 6 — EKS Cluster Setup
+## 8. Phase 6 — Post-Terraform: EKS Add-ons
 
-### Step 6.1 — Create EKS Cluster
+### Step 6.1 — Install AWS Load Balancer Controller
 
-This takes 15–20 minutes. Run from the Jenkins EC2 or your local machine with AWS CLI configured:
+The Ingress resource uses ALB annotations. This controller must be installed after EKS is up.
 
-```bash
-eksctl create cluster \
-  --name med-erp-prod-eks \
-  --region us-east-1 \
-  --version 1.29 \
-  --nodegroup-name standard-workers \
-  --node-type t3.medium \
-  --nodes 2 \
-  --nodes-min 2 \
-  --nodes-max 5 \
-  --managed \
-  --with-oidc \
-  --alb-ingress-access \
-  --full-ecr-access
-```
-
-> The `--with-oidc` flag enables IAM Roles for Service Accounts (IRSA), needed for the ALB controller.
-
-### Step 6.2 — Verify Cluster
+**Create the IAM policy:**
 
 ```bash
-# Update kubeconfig
-aws eks update-kubeconfig --region us-east-1 --name med-erp-prod-eks
-
-# Check nodes
-kubectl get nodes
-# You should see 2 Ready nodes
-
-# Check cluster info
-kubectl cluster-info
-```
-
-### Step 6.3 — Install AWS Load Balancer Controller
-
-The Ingress in `k8s/ingress/ingress.yaml` uses annotations that require the AWS ALB Ingress Controller.
-
-**Step A — Create IAM policy for ALB Controller:**
-
-```bash
-curl -o iam_policy.json https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json
+curl -o iam_policy.json \
+  https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.7.2/docs/install/iam_policy.json
 
 aws iam create-policy \
   --policy-name AWSLoadBalancerControllerIAMPolicy \
   --policy-document file://iam_policy.json
 ```
 
-**Step B — Create IAM service account:**
+**Create IAM service account (uses OIDC provider Terraform created):**
 
 ```bash
+AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+
 eksctl create iamserviceaccount \
-  --cluster=med-erp-prod-eks \
+  --cluster=med-erp-dev-eks \
   --namespace=kube-system \
   --name=aws-load-balancer-controller \
   --role-name AmazonEKSLoadBalancerControllerRole \
-  --attach-policy-arn=arn:aws:iam::<YOUR_ACCOUNT_ID>:policy/AWSLoadBalancerControllerIAMPolicy \
+  --attach-policy-arn=arn:aws:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy \
   --approve
 ```
 
-**Step C — Install via Helm:**
+**Install via Helm:**
 
 ```bash
 helm repo add eks https://aws.github.io/eks-charts
 helm repo update eks
 
+VPC_ID=$(aws ec2 describe-vpcs \
+  --filters "Name=tag:Name,Values=med-erp-dev-vpc" \
+  --query 'Vpcs[0].VpcId' --output text)
+
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller \
   -n kube-system \
-  --set clusterName=med-erp-prod-eks \
+  --set clusterName=med-erp-dev-eks \
   --set serviceAccount.create=false \
-  --set serviceAccount.name=aws-load-balancer-controller
+  --set serviceAccount.name=aws-load-balancer-controller \
+  --set vpcId=$VPC_ID
 
 # Verify it's running
-kubectl get deployment -n kube-system aws-load-balancer-controller
+kubectl get deployment aws-load-balancer-controller -n kube-system
 ```
 
-### Step 6.4 — Install Metrics Server (required for HPA)
-
-The project uses HorizontalPodAutoscalers. Metrics server must be running:
+### Step 6.2 — Install Metrics Server (required for HPA)
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
 
-# Verify
+# Wait and verify
 kubectl get deployment metrics-server -n kube-system
+kubectl top nodes   # Should return CPU/memory data after ~2 minutes
 ```
 
 ---
@@ -512,37 +808,35 @@ kubectl get deployment metrics-server -n kube-system
 
 ```bash
 kubectl apply -f k8s/namespace/namespace.yaml
-# OR directly:
-kubectl create namespace med-erp
 kubectl get namespace med-erp
 ```
 
 ### Step 7.2 — Create Kubernetes Secrets
 
-The secrets file `k8s/secrets/app-secrets.yaml` contains placeholder base64 values. Replace them with your real MongoDB URIs and JWT secret before applying.
+The file `k8s/secrets/app-secrets.yaml` has placeholder base64 values. Replace them with your real secrets.
 
-**Generate your JWT secret (256-bit hex):**
+**Generate a strong JWT secret:**
 
 ```bash
 openssl rand -hex 32
-# Example output: 7f3a9b2c1d4e5f6a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a
+# Example: a3f9c2d1b4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1
 ```
 
 **Base64 encode your values:**
 
 ```bash
-# MongoDB URIs (replace with your actual Atlas connection strings)
-echo -n "mongodb+srv://user-svc:PASSWORD@cluster.mongodb.net/users_db?retryWrites=true&w=majority" | base64
+# MongoDB URIs
+echo -n "mongodb+srv://user-svc:PASSWORD@med-erp-cluster.xxxxx.mongodb.net/users_db?retryWrites=true&w=majority" | base64
 
-echo -n "mongodb+srv://product-svc:PASSWORD@cluster.mongodb.net/products_db?retryWrites=true&w=majority" | base64
+echo -n "mongodb+srv://product-svc:PASSWORD@med-erp-cluster.xxxxx.mongodb.net/products_db?retryWrites=true&w=majority" | base64
 
-echo -n "mongodb+srv://order-svc:PASSWORD@cluster.mongodb.net/orders_db?retryWrites=true&w=majority" | base64
+echo -n "mongodb+srv://order-svc:PASSWORD@med-erp-cluster.xxxxx.mongodb.net/orders_db?retryWrites=true&w=majority" | base64
 
-# JWT Secret
-echo -n "your-openssl-generated-hex-secret" | base64
+# JWT secret
+echo -n "YOUR_OPENSSL_HEX_OUTPUT" | base64
 ```
 
-**Edit `k8s/secrets/app-secrets.yaml`** and replace the base64 values:
+**Edit `k8s/secrets/app-secrets.yaml`** with your encoded values:
 
 ```yaml
 apiVersion: v1
@@ -552,175 +846,149 @@ metadata:
   namespace: med-erp
 type: Opaque
 data:
-  MONGODB_URI_USER: <base64-encoded-users-db-uri>
-  MONGODB_URI_PRODUCT: <base64-encoded-products-db-uri>
-  MONGODB_URI_ORDER: <base64-encoded-orders-db-uri>
-  JWT_SECRET: <base64-encoded-jwt-secret>
+  MONGODB_URI_USER:    <paste-base64-users-uri-here>
+  MONGODB_URI_PRODUCT: <paste-base64-products-uri-here>
+  MONGODB_URI_ORDER:   <paste-base64-orders-uri-here>
+  JWT_SECRET:          <paste-base64-jwt-secret-here>
 ```
-
-**Apply secrets:**
 
 ```bash
 kubectl apply -f k8s/secrets/app-secrets.yaml
 kubectl get secrets -n med-erp
 ```
 
-### Step 7.3 — Update ConfigMap
+### Step 7.3 — Apply ConfigMap
 
-Edit `k8s/configmaps/app-config.yaml` — update the CORS origin to your actual frontend domain:
+Edit `k8s/configmaps/app-config.yaml` — update the CORS origin to your domain:
 
 ```yaml
 data:
-  JWT_EXPIRATION: "86400000"
-  JWT_REFRESH_EXPIRATION: "604800000"
-  CORS_ALLOWED_ORIGINS: "https://med-erp.yourdomain.com"   # ← Update this
-  LOW_STOCK_THRESHOLD: "10"
-  PRODUCT_SERVICE_URL: "http://product-service:8082/api/v1"
-  USER_SERVICE_URL: "http://user-service:8081/api/v1"
+  JWT_EXPIRATION:          "86400000"
+  JWT_REFRESH_EXPIRATION:  "604800000"
+  CORS_ALLOWED_ORIGINS:    "https://dev.med-erp.yourdomain.com"   # ← your frontend URL
+  LOW_STOCK_THRESHOLD:     "10"
+  PRODUCT_SERVICE_URL:     "http://product-service:8082/api/v1"
+  USER_SERVICE_URL:        "http://user-service:8081/api/v1"
 ```
 
 ```bash
 kubectl apply -f k8s/configmaps/app-config.yaml
-kubectl get configmap -n med-erp
 ```
 
-### Step 7.4 — Update Deployment Manifests
+### Step 7.4 — Update Ingress Manifest
 
-Before first manual deploy, update each deployment YAML to point to your ECR registry.
-
-In `k8s/deployments/user-service-deployment.yaml`, replace:
-```yaml
-image: YOUR_ECR_REGISTRY/user-service:latest
-```
-With:
-```yaml
-image: 123456789012.dkr.ecr.us-east-1.amazonaws.com/med-erp/user-service:latest
-```
-
-Do the same for `product-service-deployment.yaml` and `order-service-deployment.yaml`.
-
-### Step 7.5 — Update Ingress
-
-Edit `k8s/ingress/ingress.yaml`:
+Edit `k8s/ingress/ingress.yaml` — replace placeholder values:
 
 ```yaml
-# Replace these two values:
-alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:YOUR_ACCOUNT_ID:certificate/YOUR_CERT_ID
-alb.ingress.kubernetes.io/security-groups: sg-XXXXXXXXXX
+annotations:
+  alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:YOUR_ACCOUNT_ID:certificate/YOUR_CERT_ID
+  alb.ingress.kubernetes.io/security-groups: sg-XXXXXXXXXX   # leave blank to auto-create
 
-# Replace the host:
-- host: api.med-erp.yourdomain.com    # ← your actual domain
+spec:
+  rules:
+    - host: dev.api.med-erp.yourdomain.com    # ← your actual API subdomain
 ```
+
+> To find available security groups:
+> ```bash
+> aws ec2 describe-security-groups --filters "Name=vpc-id,Values=$VPC_ID" --query 'SecurityGroups[*].[GroupId,GroupName]' --output table
+> ```
+> You can remove the `security-groups` annotation entirely to let ALB create its own.
 
 ---
 
-## 10. Phase 8 — Deploy Application Manifests to EKS
+## 10. Phase 8 — First Manual Docker Build & EKS Deploy
 
-This is the **first manual deployment** — subsequent deployments will be automated by Jenkins.
+### Step 8.1 — Build and Push Images to Docker Hub
 
-### Step 8.1 — Build Docker Images Locally (First Time)
-
-On the Jenkins EC2 server (which has Docker and AWS CLI):
+On the Jenkins EC2 server:
 
 ```bash
-# Authenticate to ECR
-AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com"
+cd /home/ubuntu/edublitz-b2b-medical-erp
 
-aws ecr get-login-password --region us-east-1 | \
-  docker login --username AWS --password-stdin $ECR_REGISTRY
+# Login to Docker Hub
+docker login -u orionpax77
+# Enter your Docker Hub access token when prompted
 
-# Build and push each service
-cd /path/to/edublitz-b2b-medical-erp-main
+# Build and push user-service
+docker build -t orionpax77/med-erp-user-service:latest ./user-service/
+docker push orionpax77/med-erp-user-service:latest
 
-# user-service
-docker build -t $ECR_REGISTRY/med-erp/user-service:latest ./user-service/
-docker push $ECR_REGISTRY/med-erp/user-service:latest
+# Build and push product-service
+docker build -t orionpax77/med-erp-product-service:latest ./product-service/
+docker push orionpax77/med-erp-product-service:latest
 
-# product-service
-docker build -t $ECR_REGISTRY/med-erp/product-service:latest ./product-service/
-docker push $ECR_REGISTRY/med-erp/product-service:latest
-
-# order-service
-docker build -t $ECR_REGISTRY/med-erp/order-service:latest ./order-service/
-docker push $ECR_REGISTRY/med-erp/order-service:latest
+# Build and push order-service
+docker build -t orionpax77/med-erp-order-service:latest ./order-service/
+docker push orionpax77/med-erp-order-service:latest
 ```
 
-> Each Dockerfile is a multi-stage build: Stage 1 compiles with Maven (JDK 17), Stage 2 creates a minimal runtime image (JRE 17). The app runs as a non-root user (`appuser`).
+Each Dockerfile is a 2-stage build:
+- **Stage 1 (builder):** `eclipse-temurin:17-jdk-alpine` — compiles with Maven, skipping tests
+- **Stage 2 (runtime):** `eclipse-temurin:17-jre-alpine` — minimal image, non-root user `appuser`
 
 ### Step 8.2 — Apply All Kubernetes Manifests
 
 ```bash
-cd /path/to/edublitz-b2b-medical-erp-main
+cd /home/ubuntu/edublitz-b2b-medical-erp
 
-# 1. Namespace (already created above, idempotent)
+# Apply in correct dependency order:
 kubectl apply -f k8s/namespace/namespace.yaml
-
-# 2. Secrets
 kubectl apply -f k8s/secrets/app-secrets.yaml
-
-# 3. ConfigMap
 kubectl apply -f k8s/configmaps/app-config.yaml
-
-# 4. Services (ClusterIP — internal routing)
 kubectl apply -f k8s/services/services.yaml
-
-# 5. Deployments
 kubectl apply -f k8s/deployments/user-service-deployment.yaml
 kubectl apply -f k8s/deployments/product-service-deployment.yaml
 kubectl apply -f k8s/deployments/order-service-deployment.yaml
-
-# 6. HPA (auto-scaling)
 kubectl apply -f k8s/hpa/hpa.yaml
-
-# 7. Ingress (creates ALB)
 kubectl apply -f k8s/ingress/ingress.yaml
 ```
 
-### Step 8.3 — Verify All Pods Are Running
+### Step 8.3 — Watch Pods Start Up
 
 ```bash
-# Watch pods come up (takes 60-90 seconds for Spring Boot to start)
 kubectl get pods -n med-erp -w
-
-# Expected output:
-# NAME                               READY   STATUS    RESTARTS
-# user-service-xxxxx-xxxxx           1/1     Running   0
-# user-service-xxxxx-yyyyy           1/1     Running   0
-# product-service-xxxxx-xxxxx        1/1     Running   0
-# product-service-xxxxx-yyyyy        1/1     Running   0
-# order-service-xxxxx-xxxxx          1/1     Running   0
-# order-service-xxxxx-yyyyy          1/1     Running   0
 ```
 
-```bash
-# Check services
-kubectl get svc -n med-erp
+Spring Boot takes 60–90 seconds to start. Expected final state:
 
-# Check ingress (ALB DNS will appear after ~3 minutes)
+```
+NAME                               READY   STATUS    RESTARTS
+user-service-7d9f4c-xxxxx          1/1     Running   0
+user-service-7d9f4c-yyyyy          1/1     Running   0
+product-service-6b8d3f-xxxxx       1/1     Running   0
+product-service-6b8d3f-yyyyy       1/1     Running   0
+order-service-5c7e2a-xxxxx         1/1     Running   0
+order-service-5c7e2a-yyyyy         1/1     Running   0
+```
+
+### Step 8.4 — Get the ALB DNS Name
+
+After applying the ingress, the ALB is created (takes ~3 minutes):
+
+```bash
 kubectl get ingress -n med-erp
-
-# Check HPA
-kubectl get hpa -n med-erp
-
-# Check pod logs if issues
-kubectl logs -n med-erp deployment/user-service --tail=50
-kubectl logs -n med-erp deployment/product-service --tail=50
-kubectl logs -n med-erp deployment/order-service --tail=50
+# NAME               CLASS   HOSTS                          ADDRESS
+# med-erp-ingress    alb     dev.api.med-erp.yourdomain.com k8s-mederp-XXXXXX.us-east-1.elb.amazonaws.com
 ```
 
-### Step 8.4 — Verify Health Endpoints
+**Copy that ALB DNS name** — you need it for:
+1. Route53 DNS record (Terraform `alb_dns_name` variable)
+2. Verifying health endpoints
 
-Once the ingress has an ALB DNS name, test the health endpoints:
+### Step 8.5 — Update Route53 ALB Record via Terraform
+
+Now that you have the ALB DNS, update `terraform.tfvars`:
+
+```hcl
+alb_dns_name = "k8s-mederp-XXXXXX.us-east-1.elb.amazonaws.com"
+```
+
+Re-run Terraform to create the Route53 CNAME:
 
 ```bash
-# Get ALB DNS
-ALB_DNS=$(kubectl get ingress med-erp-ingress -n med-erp -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-echo $ALB_DNS
-
-# Test health endpoints
-curl http://$ALB_DNS/api/v1/actuator/health     # user-service
-# Expected: {"status":"UP"}
+cd terraform/env/dev
+terraform apply -var="alb_dns_name=k8s-mederp-XXXXXX.us-east-1.elb.amazonaws.com"
 ```
 
 ---
@@ -731,326 +999,225 @@ curl http://$ALB_DNS/api/v1/actuator/health     # user-service
 
 Go to **Jenkins → Manage Jenkins → Credentials → System → Global credentials → Add Credentials**:
 
-**Credential 1 — AWS Credentials:**
+**Credential 1 — Docker Hub:**
+- Kind: `Username with password`
+- ID: `DOCKERHUB_CREDENTIALS`
+- Username: `orionpax77`
+- Password: your Docker Hub access token (created in Phase 5)
+
+**Credential 2 — AWS (for EKS deploy):**
 - Kind: `AWS Credentials`
 - ID: `AWS_CREDENTIALS`
-- Access Key ID: your AWS IAM user access key
-- Secret Access Key: your AWS IAM user secret key
+- Access Key ID and Secret Key from a dedicated IAM user `jenkins-ci` with policies:
+  - `AmazonEKSClusterPolicy`
+  - `AmazonS3FullAccess`
+  - `CloudFrontFullAccess`
 
-> **Tip:** Create a dedicated IAM user (`jenkins-ci-user`) with these policies: `AmazonEC2ContainerRegistryFullAccess`, `AmazonEKSClusterPolicy`, `AmazonS3FullAccess`, `CloudFrontFullAccess`
-
-**Credential 2 — SonarCloud Token:**
+**Credential 3 — SonarCloud Token:**
 - Kind: `Secret text`
 - ID: `SONARCLOUD_TOKEN`
-- Secret: your SonarCloud API token (get from sonarcloud.io → My Account → Security)
+- Get from sonarcloud.io → **My Account → Security → Generate Token**
 
-**Credential 3 — Kubeconfig File:**
+**Credential 4 — Kubeconfig:**
 - Kind: `Secret file`
 - ID: `KUBECONFIG_CREDENTIAL`
-- File: Upload your `~/.kube/config` file (contains EKS cluster access)
-
-  Generate it first:
+- Upload your `~/.kube/config` from the EC2 server:
   ```bash
-  aws eks update-kubeconfig --region us-east-1 --name med-erp-prod-eks
+  aws eks update-kubeconfig --region us-east-1 --name med-erp-dev-eks
   cat ~/.kube/config
   ```
 
-### Step 9.2 — Push Code to GitHub
+### Step 9.2 — Configure Kubernetes Plugin for Jenkins Agents
 
-Push the project to your GitHub repository. The pipelines are triggered by branch pushes.
+The pipelines use Kubernetes pods as build agents (defined in the Jenkinsfile `agent { kubernetes {...} }` blocks).
+
+1. **Manage Jenkins → Clouds → New Cloud → Kubernetes**
+2. **Kubernetes URL:** `https://XXXXXXXXXXXX.gr7.us-east-1.eks.amazonaws.com` (from Terraform output)
+3. **Jenkins URL:** `http://<EC2-PRIVATE-IP>:8080`
+4. **Jenkins tunnel:** `<EC2-PRIVATE-IP>:50000`
+5. **Test Connection** — it should say "Connected"
+6. **Save**
+
+### Step 9.3 — Push Code to GitHub
 
 ```bash
-cd edublitz-b2b-medical-erp-main
+cd /home/ubuntu/edublitz-b2b-medical-erp
 git init
 git remote add origin https://github.com/YOUR_ORG/edublitz-med-erp.git
 git add .
-git commit -m "Initial commit"
+git commit -m "Initial commit — update for Docker Hub"
 git branch -M main
 git push -u origin main
 ```
 
-### Step 9.3 — Create Backend Jenkins Pipeline
+### Step 9.4 — Create Backend Pipeline Job
 
 1. **Jenkins Dashboard → New Item**
 2. Name: `med-erp-backend`
-3. Type: `Pipeline`
-4. Click **OK**
-5. Under **Pipeline**:
+3. Type: `Pipeline` → OK
+4. **Build Triggers** → check `GitHub hook trigger for GITScm polling`
+5. **Pipeline**:
    - Definition: `Pipeline script from SCM`
-   - SCM: `Git`
-   - Repository URL: your GitHub repo URL
-   - Credentials: add GitHub credentials if private
+   - SCM: Git
+   - Repo URL: `https://github.com/YOUR_ORG/edublitz-med-erp.git`
    - Branch: `*/main`
    - Script Path: `jenkins/Jenkinsfile.backend`
-6. Under **Build Triggers**:
-   - Check `GitHub hook trigger for GITScm polling` (for webhooks)
-7. **Save**
+6. Save
 
 **Add GitHub Webhook:**
-- GitHub Repo → Settings → Webhooks → Add webhook
+- GitHub → Repo → Settings → Webhooks → Add webhook
 - Payload URL: `http://<EC2-PUBLIC-IP>:8080/github-webhook/`
 - Content type: `application/json`
-- Events: `Push events`
+- Events: Push events only
 
-### Step 9.4 — Set Pipeline Environment Variables
+### Step 9.5 — Create Frontend Pipeline Job
 
-In the pipeline job → **Configure → Pipeline → Environment variables**, add:
+1. **New Item** → `med-erp-frontend` → Pipeline
+2. Same settings, Script Path: `jenkins/Jenkinsfile.frontend`
+3. Add pipeline environment variables:
 
 | Variable | Value |
 |---|---|
-| `AWS_ACCOUNT_ID` | `123456789012` (your actual account ID) |
+| `S3_BUCKET_NAME` | `med-erp-frontend-dev` (from Terraform output) |
+| `CLOUDFRONT_DISTRIBUTION_ID` | `E1ABCDEF1234567` (from Terraform output) |
 | `DOMAIN_NAME` | `yourdomain.com` |
-| `CLOUDFRONT_DISTRIBUTION_ID` | (fill after CloudFront setup in Phase 10) |
 
-### Step 9.5 — Create Frontend Jenkins Pipeline
+### Step 9.6 — Full Backend Pipeline Stages Reference
 
-1. **Jenkins Dashboard → New Item**
-2. Name: `med-erp-frontend`
-3. Type: `Pipeline`
-4. Script Path: `jenkins/Jenkinsfile.frontend`
-5. Same SCM settings as backend
-6. **Save**
+When you push to `main`, the backend pipeline executes these stages:
 
-### Step 9.6 — Pipeline Stages Explained
+| # | Stage | Branch | Description |
+|---|---|---|---|
+| 1 | Checkout | All | Clones repo, reads git commit SHA (first 8 chars = image tag) |
+| 2 | Build & Test | All | `mvn clean verify` for all 3 services **in parallel** — runs JUnit tests |
+| 3 | SonarCloud Quality Gate | `main` only | Scans code coverage, bugs, vulnerabilities — pipeline fails if gate fails |
+| 4 | Docker Build & Push | `main` only | Builds multi-stage Docker images, tags with commit SHA + `latest`, pushes to `orionpax77/med-erp-*` |
+| 5 | Trivy Security Scan | `main` only | Scans all 3 images for HIGH/CRITICAL CVEs — pipeline fails if found |
+| 6 | Deploy to EKS | `main` only | `kubectl set image` rolling update for each deployment, waits for rollout |
 
-**Backend Pipeline (`Jenkinsfile.backend`)** runs these stages:
+### Step 9.7 — Trigger and Watch First Pipeline
 
-| Stage | What It Does | Branch |
-|---|---|---|
-| Checkout | Pulls latest code, captures git commit SHA | All |
-| Build & Test | Runs `mvn clean verify` for all 3 services in parallel | All |
-| SonarCloud Quality Gate | Scans code quality, blocks on failures | `main` only |
-| Docker Build & Push | Builds images tagged with git commit SHA, pushes to ECR | `main` only |
-| Trivy Security Scan | Scans images for HIGH/CRITICAL CVEs — fails build if found | `main` only |
-| Deploy to EKS | `kubectl set image` rolling update, waits for rollout | `main` only |
+1. Open `med-erp-backend` → **Build Now**
+2. Click the build number → **Console Output**
+3. Watch the full pipeline execute
 
-**Frontend Pipeline (`Jenkinsfile.frontend`)** stages:
-
-| Stage | What It Does |
-|---|---|
-| Checkout | Pull code |
-| Install Dependencies | `npm ci` |
-| Lint | `npm run lint` |
-| Build React App | `npm run build` with env vars injected |
-| Upload to S3 | Sync `dist/` to S3 with cache headers |
-| Invalidate CloudFront | Purge CDN cache |
-
-### Step 9.7 — Run First Build
-
-1. Open `med-erp-backend` pipeline
-2. Click **Build Now**
-3. Open **Console Output** to watch live logs
-4. First build on feature branches will run Build & Test only
-5. After merging to `main`, full pipeline (including Docker push and deploy) runs
+Alternatively install Blue Ocean plugin for a visual pipeline graph.
 
 ---
 
 ## 12. Phase 10 — Frontend Deployment (S3 + CloudFront)
 
-### Step 10.1 — Create S3 Bucket for Frontend
+> Terraform already created the S3 bucket and CloudFront distribution. This phase handles the first deploy and Jenkins automation.
+
+### Step 10.1 — Build the React Frontend Locally (First Deploy)
 
 ```bash
-aws s3 mb s3://med-erp-frontend-prod --region us-east-1
-
-# Disable block public access (CloudFront will handle access control)
-aws s3api put-public-access-block \
-  --bucket med-erp-frontend-prod \
-  --public-access-block-configuration \
-  "BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false"
-
-# Enable static website hosting
-aws s3 website s3://med-erp-frontend-prod \
-  --index-document index.html \
-  --error-document index.html
-```
-
-### Step 10.2 — Set Bucket Policy
-
-Create a file `bucket-policy.json`:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "PublicReadGetObject",
-      "Effect": "Allow",
-      "Principal": "*",
-      "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::med-erp-frontend-prod/*"
-    }
-  ]
-}
-```
-
-```bash
-aws s3api put-bucket-policy \
-  --bucket med-erp-frontend-prod \
-  --policy file://bucket-policy.json
-```
-
-### Step 10.3 — Create CloudFront Distribution
-
-```bash
-aws cloudfront create-distribution --distribution-config '{
-  "CallerReference": "med-erp-frontend-'$(date +%s)'",
-  "Origins": {
-    "Quantity": 1,
-    "Items": [{
-      "Id": "S3-med-erp-frontend-prod",
-      "DomainName": "med-erp-frontend-prod.s3-website-us-east-1.amazonaws.com",
-      "CustomOriginConfig": {
-        "HTTPPort": 80,
-        "HTTPSPort": 443,
-        "OriginProtocolPolicy": "http-only"
-      }
-    }]
-  },
-  "DefaultCacheBehavior": {
-    "TargetOriginId": "S3-med-erp-frontend-prod",
-    "ViewerProtocolPolicy": "redirect-to-https",
-    "CachePolicyId": "658327ea-f89d-4fab-a63d-7e88639e58f6",
-    "Compress": true
-  },
-  "CustomErrorResponses": {
-    "Quantity": 1,
-    "Items": [{
-      "ErrorCode": 404,
-      "ResponsePagePath": "/index.html",
-      "ResponseCode": "200",
-      "ErrorCachingMinTTL": 0
-    }]
-  },
-  "Enabled": true,
-  "HttpVersion": "http2",
-  "Comment": "Med ERP Frontend"
-}'
-```
-
-**Save the Distribution ID** (e.g., `E1ABCDEF1234`) — add it to Jenkins environment variables as `CLOUDFRONT_DISTRIBUTION_ID`.
-
-### Step 10.4 — Build and Deploy Frontend Manually (First Time)
-
-```bash
-cd frontend
-
-# Copy example env and fill in values
+cd /home/ubuntu/edublitz-b2b-medical-erp/frontend
 cp .env.example .env
 
 # Edit .env:
-VITE_USER_SERVICE_URL=https://api.med-erp.yourdomain.com/api/v1
-VITE_PRODUCT_SERVICE_URL=https://api.med-erp.yourdomain.com/api/v1
-VITE_ORDER_SERVICE_URL=https://api.med-erp.yourdomain.com/api/v1
+VITE_USER_SERVICE_URL=https://dev.api.med-erp.yourdomain.com/api/v1
+VITE_PRODUCT_SERVICE_URL=https://dev.api.med-erp.yourdomain.com/api/v1
+VITE_ORDER_SERVICE_URL=https://dev.api.med-erp.yourdomain.com/api/v1
+```
+
+```bash
+# Install Node.js 20 if not present
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
 
 npm install
 npm run build
+# Creates a dist/ folder with the compiled React app
+```
 
-# Deploy to S3
-aws s3 sync dist/ s3://med-erp-frontend-prod/ \
+### Step 10.2 — Upload to S3
+
+```bash
+S3_BUCKET="med-erp-frontend-dev"   # From Terraform output
+
+# Upload assets with long cache (JS, CSS, images)
+aws s3 sync dist/ s3://$S3_BUCKET/ \
+  --region us-east-1 \
   --delete \
   --cache-control "public,max-age=31536000,immutable" \
   --exclude "*.html"
 
-aws s3 cp dist/index.html s3://med-erp-frontend-prod/index.html \
+# Upload index.html with no cache (always fresh for SPA)
+aws s3 cp dist/index.html s3://$S3_BUCKET/index.html \
+  --region us-east-1 \
   --cache-control "no-cache,no-store,must-revalidate" \
   --content-type "text/html"
 ```
 
+### Step 10.3 — Invalidate CloudFront Cache
+
+```bash
+DIST_ID="E1ABCDEF1234567"   # From Terraform output
+
+INVALIDATION_ID=$(aws cloudfront create-invalidation \
+  --distribution-id $DIST_ID \
+  --paths "/*" \
+  --query 'Invalidation.Id' \
+  --output text)
+
+echo "Invalidation created: $INVALIDATION_ID"
+
+# Wait for it to complete
+aws cloudfront wait invalidation-completed \
+  --distribution-id $DIST_ID \
+  --id $INVALIDATION_ID
+
+echo "CloudFront cache cleared."
+```
+
+After this, the frontend pipeline (triggered by Git push) handles all future deploys automatically via `jenkins/Jenkinsfile.frontend`.
+
 ---
 
-## 13. Phase 11 — DNS & Domain Configuration
+## 13. Phase 11 — DNS Final Wiring
 
-### Step 11.1 — Get ALB DNS Name
-
-```bash
-kubectl get ingress -n med-erp
-# HOSTS                           ADDRESS
-# api.med-erp.yourdomain.com      k8s-mederpxxxxxxxx.us-east-1.elb.amazonaws.com
-```
-
-### Step 11.2 — Create Route53 Hosted Zone (if not exists)
+Terraform's Route53 module already created the DNS records when you ran `terraform apply` with the `alb_dns_name` variable. Verify they are working:
 
 ```bash
-aws route53 create-hosted-zone \
-  --name yourdomain.com \
-  --caller-reference $(date +%s)
+# Check A record for frontend
+dig dev.med-erp.yourdomain.com
+# Should return CloudFront IP addresses
+
+# Check CNAME for API
+dig dev.api.med-erp.yourdomain.com
+# Should resolve to your ALB DNS name
 ```
 
-Note the nameservers and update them in your domain registrar.
-
-### Step 11.3 — Create DNS Records
-
-**API subdomain (CNAME to ALB):**
+If you registered the domain outside Route53, update your domain registrar's nameservers to the Route53 NS records:
 
 ```bash
-aws route53 change-resource-record-sets \
-  --hosted-zone-id YOUR_ZONE_ID \
-  --change-batch '{
-    "Changes": [{
-      "Action": "CREATE",
-      "ResourceRecordSet": {
-        "Name": "api.med-erp.yourdomain.com",
-        "Type": "CNAME",
-        "TTL": 300,
-        "ResourceRecords": [{"Value": "k8s-mederpxxxxxxxx.us-east-1.elb.amazonaws.com"}]
-      }
-    }]
-  }'
+aws route53 list-hosted-zones --query 'HostedZones[?Name==`yourdomain.com.`].Id' --output text
+# Get zone ID, then:
+aws route53 get-hosted-zone --id /hostedzone/XXXXXXXXXXXXX \
+  --query 'DelegationSet.NameServers'
 ```
-
-**Frontend subdomain (Alias to CloudFront):**
-
-```bash
-aws route53 change-resource-record-sets \
-  --hosted-zone-id YOUR_ZONE_ID \
-  --change-batch '{
-    "Changes": [{
-      "Action": "CREATE",
-      "ResourceRecordSet": {
-        "Name": "med-erp.yourdomain.com",
-        "Type": "A",
-        "AliasTarget": {
-          "HostedZoneId": "Z2FDTNDATAQYW2",
-          "DNSName": "XXXXXXXXXXXX.cloudfront.net",
-          "EvaluateTargetHealth": false
-        }
-      }
-    }]
-  }'
-```
-
-> CloudFront's hosted zone ID is always `Z2FDTNDATAQYW2` (AWS global constant).
 
 ---
 
 ## 14. Phase 12 — Verify Live Application
 
-### Step 14.1 — Backend Health Checks
+### Step 14.1 — Test Backend Health Endpoints
 
 ```bash
-# Test all service health endpoints via ALB
-curl https://api.med-erp.yourdomain.com/api/v1/actuator/health
-# Expected: {"status":"UP","components":{"mongo":{"status":"UP"},...}}
+# Should return {"status":"UP"} with MongoDB connected
+curl https://dev.api.med-erp.yourdomain.com/api/v1/actuator/health
 
-# Test auth endpoint (should return 401 without token)
-curl -X POST https://api.med-erp.yourdomain.com/api/v1/auth/login \
+# Should return 401 (proves auth is working)
+curl -X POST https://dev.api.med-erp.yourdomain.com/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email":"test@test.com","password":"wrong"}'
-# Expected: 401 Unauthorized
+  -d '{"email":"x@x.com","password":"wrong"}'
 ```
 
-### Step 14.2 — Swagger API Documentation
-
-Each service exposes Swagger UI:
-
-- User Service: `https://api.med-erp.yourdomain.com/api/v1/swagger-ui.html`
-- Product Service: `https://api.med-erp.yourdomain.com/api/v1/swagger-ui.html` (via `/api/v1/products/...`)
-- Order Service: `https://api.med-erp.yourdomain.com/api/v1/swagger-ui.html`
-
-### Step 14.3 — Create First Admin User
+### Step 14.2 — Register First Admin User
 
 ```bash
-curl -X POST https://api.med-erp.yourdomain.com/api/v1/auth/register \
+curl -X POST https://dev.api.med-erp.yourdomain.com/api/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{
     "email": "admin@yourdomain.com",
@@ -1058,48 +1225,54 @@ curl -X POST https://api.med-erp.yourdomain.com/api/v1/auth/register \
     "firstName": "Admin",
     "lastName": "User",
     "role": "ADMIN",
-    "organizationName": "EduBlitz Admin"
+    "organizationName": "EduBlitz Admin Org"
   }'
 ```
 
-### Step 14.4 — Access the Frontend
+### Step 14.3 — Access the Frontend
 
-Navigate to `https://med-erp.yourdomain.com` in your browser. You should see the React login page.
+Open `https://dev.med-erp.yourdomain.com` in your browser. You should see the React login page.
 
-### Step 14.5 — Verify Kubernetes Cluster Health
+Log in with the admin credentials you just created.
+
+### Step 14.4 — Verify All K8s Resources
 
 ```bash
-# All pods running
+# Pods — all should be 1/1 Running
 kubectl get pods -n med-erp
-kubectl get pods -n kube-system
 
-# HPA active
-kubectl get hpa -n med-erp
-
-# Ingress has an address
-kubectl get ingress -n med-erp
-
-# Services accessible
+# Services — 3 ClusterIP services
 kubectl get svc -n med-erp
 
-# Check resource usage
+# Ingress — should have ALB ADDRESS
+kubectl get ingress -n med-erp
+
+# HPA — should show current vs target replicas
+kubectl get hpa -n med-erp
+
+# Resource usage
 kubectl top pods -n med-erp
 kubectl top nodes
 ```
 
-### Step 14.6 — Verify CI/CD Pipeline
+### Step 14.5 — Verify Full CI/CD Loop
 
-1. Make a small code change and push to `main`
-2. Jenkins should auto-trigger the pipeline
-3. Watch pipeline stages execute in Blue Ocean UI
-4. After ~10 minutes, new image should be deployed to EKS
-5. Verify with `kubectl rollout history deployment/user-service -n med-erp`
+1. Make a trivial change (e.g., update a comment in a Java file)
+2. Commit and push to `main`
+3. GitHub webhook triggers Jenkins
+4. Watch pipeline in Jenkins UI:
+   - Build & Test (parallel Maven)
+   - SonarCloud Quality Gate
+   - Docker build + push to `orionpax77/med-erp-*`
+   - Trivy scan
+   - `kubectl set image` rolling deploy
+5. After ~10 minutes: `kubectl rollout history deployment/user-service -n med-erp` shows a new revision
 
 ---
 
 ## 15. Troubleshooting Reference
 
-### Pods not starting (CrashLoopBackOff)
+### Pods in CrashLoopBackOff
 
 ```bash
 kubectl describe pod <POD_NAME> -n med-erp
@@ -1107,11 +1280,11 @@ kubectl logs <POD_NAME> -n med-erp --previous
 ```
 
 Common causes:
-- MongoDB connection string wrong in Secret — re-encode and reapply
-- JWT secret mismatch between services
-- ECR image not pushed / wrong image name in deployment
+- MongoDB URI is wrong — check base64 encoding, re-apply secret
+- JWT secret has whitespace — regenerate with `openssl rand -hex 32`
+- Docker Hub image not pushed / wrong tag — verify on hub.docker.com
 
-### ALB not created after Ingress apply
+### ALB Not Created After Ingress Apply
 
 ```bash
 kubectl describe ingress med-erp-ingress -n med-erp
@@ -1119,85 +1292,98 @@ kubectl logs -n kube-system deployment/aws-load-balancer-controller
 ```
 
 Common causes:
-- ALB Controller not installed or not running
-- Security group ID in ingress annotations is wrong
-- ACM certificate ARN incorrect
+- ALB Controller not installed — re-run Phase 6.1
+- Subnet tags missing — check Terraform VPC module applied `kubernetes.io/role/elb=1` tags
+- ACM certificate ARN wrong or not in `us-east-1`
 
-### Jenkins pipeline fails at Deploy to EKS
+### Terraform Apply Fails
 
 ```bash
-# Check if kubeconfig is valid
-kubectl get nodes  # run on EC2
+# State lock stuck (previous run interrupted)
+aws dynamodb delete-item \
+  --table-name med-erp-terraform-locks \
+  --key '{"LockID": {"S": "med-erp-terraform-state-dev/dev/terraform.tfstate"}}'
 
-# Check AWS credentials have EKS access
-aws eks describe-cluster --name med-erp-prod-eks --region us-east-1
+# Re-run
+terraform apply
 ```
 
-### HPA not scaling
+### Jenkins Pipeline Cannot Push to Docker Hub
+
+- Verify credential ID is exactly `DOCKERHUB_CREDENTIALS`
+- Test login from EC2: `docker login -u orionpax77`
+- Ensure the access token has write permissions
+
+### SonarCloud Quality Gate Fails
+
+- Check the SonarCloud dashboard at sonarcloud.io
+- Common fix: ensure `sonar.organization` in Jenkinsfile matches your SonarCloud org slug
+- To bypass during initial setup only: remove `sonar.qualitygate.wait=true`
+
+### HPA Shows `<unknown>` Metrics
 
 ```bash
 kubectl describe hpa -n med-erp
-# If "unknown" metrics, metrics-server is not running
-kubectl get deployment metrics-server -n kube-system
+# If metrics unavailable, metrics-server is not working
+kubectl rollout restart deployment/metrics-server -n kube-system
 ```
-
-### Frontend shows blank page
-
-- Check browser console for network errors
-- Verify `VITE_*` environment variables are set correctly
-- Check CloudFront has the right origin and index.html exists in S3:
-  ```bash
-  aws s3 ls s3://med-erp-frontend-prod/
-  ```
 
 ---
 
 ## 16. Security Hardening Checklist
 
-Before going fully live, verify these security items:
+Before promoting to production, verify every item:
 
-- [ ] Kubernetes Secrets contain real values (not placeholder base64 from the repo)
-- [ ] JWT secret is a strong random 256-bit hex value
-- [ ] MongoDB Atlas users use least-privilege (not `atlasAdmin`)
-- [ ] MongoDB Atlas network access restricts to EKS NAT Gateway IPs only
-- [ ] AWS Security Groups allow only required ports
-- [ ] Jenkins EC2 Security Group restricts SSH (port 22) to your IP only
-- [ ] ACM certificate is valid and ALB is redirecting HTTP → HTTPS
-- [ ] Trivy scans are not suppressed (pipeline fails on HIGH/CRITICAL)
-- [ ] SonarCloud quality gate is enforced (pipeline fails on quality gate failure)
-- [ ] `k8s/secrets/app-secrets.yaml` with real values is **never committed to Git**
-- [ ] ECR image scanning on push is enabled
-- [ ] All pods run as non-root user (`appuser`) — verified in Dockerfiles
-- [ ] Pod Anti-Affinity is configured (ensures replicas land on different nodes)
-- [ ] HPA min replicas = 2 for all services (no single point of failure)
+- [ ] `k8s/secrets/app-secrets.yaml` with real values is **never committed to Git** — add it to `.gitignore`
+- [ ] MongoDB Atlas users are least-privilege (not atlasAdmin)
+- [ ] Atlas network access is restricted to NAT Gateway IPs only (not 0.0.0.0/0)
+- [ ] JWT secret is a fresh `openssl rand -hex 32` — not the default from the repo
+- [ ] Docker Hub repositories are set to **private** if the code is proprietary
+- [ ] EKS API endpoint is private-only in prod (`endpoint_public_access = false` in `terraform/env/prod/main.tf`)
+- [ ] Prod EKS uses ON_DEMAND nodes (no Spot interruptions)
+- [ ] ACM certificate is valid and ALB enforces HTTPS redirect
+- [ ] Trivy pipeline stage is NOT suppressed — builds must fail on HIGH/CRITICAL CVEs
+- [ ] SonarCloud quality gate is enforced on every merge to main
+- [ ] All pods run as non-root `appuser` — confirmed in Dockerfiles
+- [ ] Pod Anti-Affinity is set (pods spread across different nodes — already in deployment YAMLs)
+- [ ] HPA min replicas = 2 (no single point of failure)
+- [ ] Jenkins EC2 Security Group: SSH (port 22) restricted to your IP only
+- [ ] Terraform state S3 bucket has public access blocked and versioning enabled
 
 ---
 
-## Quick Reference — Useful Commands
+## Quick Reference Commands
 
 ```bash
-# --- Kubernetes ---
-kubectl get all -n med-erp                          # Full overview
-kubectl rollout restart deployment/user-service -n med-erp    # Force restart
-kubectl rollout undo deployment/user-service -n med-erp       # Roll back
-kubectl exec -it <POD> -n med-erp -- /bin/sh        # Shell into pod
-kubectl port-forward svc/user-service 8081:8081 -n med-erp    # Local test
+# ── Kubernetes ──────────────────────────────────────────────────────
+kubectl get all -n med-erp                                    # Full overview
+kubectl rollout restart deployment/user-service -n med-erp    # Force pod restart
+kubectl rollout undo deployment/user-service -n med-erp       # Roll back one version
+kubectl rollout history deployment/user-service -n med-erp    # See deploy history
+kubectl exec -it <POD> -n med-erp -- /bin/sh                  # Shell into pod
+kubectl port-forward svc/user-service 8081:8081 -n med-erp    # Local port-forward
 
-# --- Jenkins ---
-sudo systemctl restart jenkins
-sudo cat /var/lib/jenkins/logs/tasks/*.log           # Jenkins logs
+# ── Terraform ──────────────────────────────────────────────────────
+cd terraform/env/dev
+terraform plan                         # Preview changes
+terraform apply                        # Apply changes
+terraform output                       # Show all outputs
+terraform destroy                      # Tear down everything (careful!)
 
-# --- ECR ---
-aws ecr list-images --repository-name med-erp/user-service --region us-east-1
+# ── Docker Hub ─────────────────────────────────────────────────────
+docker pull orionpax77/med-erp-user-service:latest
+docker images | grep orionpax77
+docker system prune -f                 # Clean up disk on Jenkins server
 
-# --- EKS ---
+# ── EKS ────────────────────────────────────────────────────────────
+aws eks update-kubeconfig --region us-east-1 --name med-erp-dev-eks
 eksctl get cluster --region us-east-1
-aws eks update-kubeconfig --region us-east-1 --name med-erp-prod-eks
 
-# --- Docker ---
-docker system prune -f   # Clean up disk on Jenkins server
+# ── Jenkins ────────────────────────────────────────────────────────
+sudo systemctl restart jenkins
+sudo journalctl -u jenkins -f          # Live logs
 ```
 
 ---
 
-*Documentation version: 1.0 | Project: EduBlitz Medical B2B ERP | Stack: Spring Boot + React + MongoDB + EKS + Jenkins*
+*Documentation version: 2.0 | Project: EduBlitz Medical B2B ERP | Registry: Docker Hub (orionpax77) | Stack: Spring Boot 3 + React 18 + MongoDB Atlas + EKS + Terraform + Jenkins*
