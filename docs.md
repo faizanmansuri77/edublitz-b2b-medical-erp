@@ -154,7 +154,7 @@ Run all commands via SSH on the EC2 instance.
 ### Step 2.1 — Install Java 17 (required for Jenkins)
 
 ```bash
-sudo apt-get install -y fontconfig openjdk-17-jre
+sudo apt-get install -y fontconfig openjdk-21-jre
 java -version
 # Expected output: openjdk version "17.x.x"
 ```
